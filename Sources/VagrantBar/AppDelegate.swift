@@ -8,7 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var machines: [VagrantMachine] = []
     private var lastError: String?
+    /// Machines with an action started from this app.
     private var busyMachines: Set<String> = []
+    /// Machines a vagrant command outside this app is working on (terminal, ...).
+    private var externalBusyMachines: Set<String> = []
     private var refreshing = false
     private var timer: Timer?
 
@@ -32,11 +35,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshing = true
         queue.async { [client] in
             let result = Result { try client.globalStatus() }
+            let processes = VagrantProcesses.running()
             DispatchQueue.main.async {
                 self.refreshing = false
                 switch result {
                 case .success(let machines):
                     self.machines = machines
+                    self.externalBusyMachines = VagrantProcesses.busyMachineIDs(machines, processes: processes)
                     self.lastError = nil
                 case .failure(let error):
                     self.lastError = error.localizedDescription
@@ -50,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         let anyRunning = machines.contains(where: \.isRunning)
-        let title = busyMachines.isEmpty ? "V" : "V…"
+        let title = busyMachines.isEmpty && externalBusyMachines.isEmpty ? "V" : "V…"
         let font = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize(for: .regular) + 1)
         var attributes: [NSAttributedString.Key: Any] = [.font: font]
         if anyRunning {
@@ -98,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func machineItem(_ machine: VagrantMachine) -> NSMenuItem {
         let item = NSMenuItem(title: machine.name, action: nil, keyEquivalent: "")
-        let busy = busyMachines.contains(machine.id)
+        let busy = isBusy(machine)
 
         let dot = machine.isRunning ? "●" : "○"
         let title = NSMutableAttributedString(
@@ -163,6 +168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func isBusy(_ machine: VagrantMachine) -> Bool {
+        busyMachines.contains(machine.id) || externalBusyMachines.contains(machine.id)
+    }
+
     private func machine(for sender: NSMenuItem) -> VagrantMachine? {
         guard let id = sender.representedObject as? String else { return nil }
         return machines.first { $0.id == id }
@@ -181,6 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch result {
                 case .success(let r) where r.status != 0:
                     let output = r.stderr.isEmpty ? r.stdout : r.stderr
+                    if VagrantClient.isMachineLockedError(output) {
+                        self.showError(title: "\(machine.name) is busy",
+                                       message: "Another Vagrant command is still working on this machine. Try again when it finishes.")
+                        break
+                    }
                     self.showError(title: "vagrant \(command) failed for \(machine.name)",
                                    message: VagrantClient.tail(output))
                 case .failure(let error):
