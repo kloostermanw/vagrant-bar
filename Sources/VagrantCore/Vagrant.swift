@@ -1,6 +1,6 @@
 import Foundation
 
-public struct VagrantMachine: Equatable {
+public struct VagrantMachine: Equatable, Sendable {
     public var id: String
     public var provider: String = ""
     public var home: String = ""
@@ -20,7 +20,7 @@ public struct VagrantMachine: Equatable {
     }
 }
 
-public struct CommandResult {
+public struct CommandResult: Sendable {
     public let status: Int32
     public let stdout: String
     public let stderr: String
@@ -38,7 +38,7 @@ public enum VagrantError: LocalizedError {
     }
 }
 
-public struct VagrantClient {
+public struct VagrantClient: Sendable {
     public let binary: String
 
     public init(binary: String = "/usr/local/bin/vagrant") {

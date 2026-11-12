@@ -29,12 +29,23 @@ ln -s /Applications "$STAGING/Applications"   # drag-target for the user
 
 echo "==> Creating $DMG_OUT"
 rm -f "$DMG_OUT"
-hdiutil create \
-  -volname "$APP_NAME" \
-  -srcfolder "$STAGING" \
-  -fs HFS+ \
-  -format UDZO \
-  -ov \
-  "$DMG_OUT" >/dev/null
+# `hdiutil create -volname -format` is deprecated in favour of `diskutil image`,
+# which only exists on recent macOS; fall back to hdiutil on older systems.
+if diskutil image create from --help >/dev/null 2>&1; then
+  # diskutil writes progress to stderr; only show its output if it fails.
+  out="$(diskutil image create from \
+    --format UDZO \
+    --volumeName "$APP_NAME" \
+    "$STAGING" \
+    "$DMG_OUT" 2>&1)" || { echo "$out" >&2; exit 1; }
+else
+  hdiutil create \
+    -volname "$APP_NAME" \
+    -srcfolder "$STAGING" \
+    -fs HFS+ \
+    -format UDZO \
+    -ov \
+    "$DMG_OUT" >/dev/null
+fi
 
 echo "==> Done: $(pwd)/$DMG_OUT"
