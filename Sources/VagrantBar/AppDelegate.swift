@@ -91,32 +91,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func buildMenu(_ menu: NSMenu) {
-        menu.removeAllItems()
+        apply(menuItems(), to: menu)
+    }
+
+    /// Updates the menu to show `items`. The menu is rebuilt while it is open (a refresh
+    /// finishing), and macOS mis-sizes an open menu whose items are all removed and
+    /// re-added, leaving an empty row under Quit. So when the layout is unchanged,
+    /// update the existing items in place and only rebuild when rows come or go.
+    private func apply(_ items: [NSMenuItem], to menu: NSMenu) {
+        let sameLayout = menu.items.count == items.count
+            && zip(menu.items, items).allSatisfy { $0.isSeparatorItem == $1.isSeparatorItem }
+        guard sameLayout else {
+            menu.removeAllItems()
+            items.forEach(menu.addItem)
+            return
+        }
+        for (existing, item) in zip(menu.items, items) where !item.isSeparatorItem {
+            existing.title = item.title
+            existing.attributedTitle = item.attributedTitle
+            existing.action = item.action
+            existing.target = item.target
+            existing.representedObject = item.representedObject
+            existing.keyEquivalent = item.keyEquivalent
+            existing.isEnabled = item.isEnabled
+            existing.toolTip = item.toolTip
+            // A submenu can only belong to one item: detach it from the throwaway item first.
+            let submenu = item.submenu
+            item.submenu = nil
+            existing.submenu = submenu
+        }
+    }
+
+    private func menuItems() -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
 
         if let lastError {
             let item = NSMenuItem(title: lastError, action: nil, keyEquivalent: "")
             item.isEnabled = false
-            menu.addItem(item)
-            menu.addItem(.separator())
+            items.append(item)
+            items.append(.separator())
         }
 
         if machines.isEmpty && lastError == nil {
             let item = NSMenuItem(title: "No Vagrant machines", action: nil, keyEquivalent: "")
             item.isEnabled = false
-            menu.addItem(item)
+            items.append(item)
         }
 
         for machine in machines {
-            menu.addItem(machineItem(machine))
+            items.append(machineItem(machine))
         }
 
-        menu.addItem(.separator())
+        items.append(.separator())
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshClicked), keyEquivalent: "r")
         refreshItem.target = self
-        menu.addItem(refreshItem)
-        menu.addItem(.separator())
-        for item in updateMenuItems() { menu.addItem(item) }
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        items.append(refreshItem)
+        items.append(.separator())
+        items += updateMenuItems()
+        items.append(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        return items
     }
 
     private func machineItem(_ machine: VagrantMachine) -> NSMenuItem {
