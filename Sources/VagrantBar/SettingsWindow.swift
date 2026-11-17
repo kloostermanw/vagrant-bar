@@ -186,22 +186,26 @@ private struct CommandEditor: View {
         )
     }
 
+    /// A label above a full-width, left-aligned bordered field. The grouped form's default
+    /// right-aligned fields make leading/trailing spaces in a command hard to see.
+    private func field(_ title: String, text: Binding<String>, prompt: String, monospaced: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+            TextField(title, text: text, prompt: Text(prompt))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.leading)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
+        }
+        .padding(.vertical, 2)
+    }
+
     var body: some View {
         Form {
             Section {
-                TextField("Name", text: $command.name, prompt: Text("Restart Apache"))
-                LabeledContent("Command") {
-                    TextField("Command", text: $command.command, prompt: Text("sudo systemctl restart apache2"))
-                        .labelsHidden()
-                        .font(.system(.body, design: .monospaced))
-                        .multilineTextAlignment(.trailing)
-                }
-                LabeledContent("Working directory") {
-                    TextField("Working directory", text: workingDirectory, prompt: Text("Optional"))
-                        .labelsHidden()
-                        .font(.system(.body, design: .monospaced))
-                        .multilineTextAlignment(.trailing)
-                }
+                field("Name", text: $command.name, prompt: "Restart Apache")
+                field("Command", text: $command.command, prompt: "sudo systemctl restart apache2", monospaced: true)
+                field("Working directory", text: workingDirectory, prompt: "Optional, e.g. /var/www/app", monospaced: true)
             } header: {
                 Text("Command")
             } footer: {
