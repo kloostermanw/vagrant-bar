@@ -127,6 +127,11 @@ public struct VagrantClient: Sendable {
         )
     }
 
+    /// Wraps `text` in single quotes for a POSIX shell.
+    public static func shellQuoted(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     public static func tail(_ text: String, lines: Int = 15) -> String {
         text.split(whereSeparator: \.isNewline).suffix(lines).joined(separator: "\n")
     }
