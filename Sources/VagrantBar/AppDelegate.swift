@@ -17,6 +17,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var externalBusyMachines: Set<String> = []
     private var refreshing = false
     private var timer: Timer?
+    private let settings = SettingsModel()
+    private var settingsWindow: SettingsWindowController?
+
+    /// Identifies a custom command menu item: which command, on which machine.
+    private struct CustomCommandRef {
+        let machineID: String
+        let commandID: UUID
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -24,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateIcon()
+
+        settings.onChange = { [weak self] in
+            guard let self, let menu = self.statusItem.menu else { return }
+            self.buildMenu(menu)
+        }
 
         refresh()
         // Scheduled timers fire on the main run loop.
@@ -57,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch result {
                 case .success(let machines):
                     self.machines = machines
+                    self.settings.machines = machines
                     self.externalBusyMachines = VagrantProcesses.busyMachineIDs(machines, processes: processes)
                     self.lastError = nil
                 case .failure(let error):
@@ -178,6 +192,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Halt", #selector(haltClicked(_:)), enabled: machine.isRunning)
         add("Reload", #selector(reloadClicked(_:)), enabled: machine.isRunning)
         sub.addItem(.separator())
+        let commands = settings.commands.filter { $0.isComplete && $0.applies(to: machine) }
+        for command in commands {
+            let i = NSMenuItem(title: command.name, action: #selector(customCommandClicked(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = CustomCommandRef(machineID: machine.id, commandID: command.id)
+            i.isEnabled = machine.isRunning && !busy
+            i.toolTip = command.script
+            sub.addItem(i)
+        }
+        if !commands.isEmpty { sub.addItem(.separator()) }
         add("SSH", #selector(sshClicked(_:)), enabled: machine.isRunning)
         add("Open Folder", #selector(openFolderClicked(_:)), enabled: !machine.home.isEmpty)
         item.submenu = sub
@@ -191,6 +215,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func haltClicked(_ sender: NSMenuItem) { runAction("halt", sender) }
     @objc private func reloadClicked(_ sender: NSMenuItem) { runAction("reload", sender) }
 
+    @objc private func customCommandClicked(_ sender: NSMenuItem) {
+        guard let ref = sender.representedObject as? CustomCommandRef,
+              let machine = machines.first(where: { $0.id == ref.machineID }),
+              let command = settings.commands.first(where: { $0.id == ref.commandID })
+        else { return }
+        run(command.sshArguments(for: machine), title: command.name, on: machine)
+    }
+
+    @objc private func settingsClicked() {
+        if settingsWindow == nil {
+            settingsWindow = SettingsWindowController(model: settings)
+        }
+        settingsWindow?.show()
+    }
+
     @objc private func openFolderClicked(_ sender: NSMenuItem) {
         guard let machine = machine(for: sender) else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: machine.home))
@@ -198,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func sshClicked(_ sender: NSMenuItem) {
         guard let machine = machine(for: sender) else { return }
-        let shellQuoted = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let shellQuoted = VagrantClient.shellQuoted
         let command = "cd \(shellQuoted(machine.home)) && \(shellQuoted(client.binary)) ssh \(machine.id)"
         let appleScriptString = command
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -230,12 +269,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func runAction(_ command: String, _ sender: NSMenuItem) {
         guard let machine = machine(for: sender) else { return }
+        run([command, machine.id], title: "vagrant \(command)", on: machine)
+    }
+
+    /// Runs `vagrant <arguments>` for `machine` in the background, showing an alert on failure.
+    private func run(_ arguments: [String], title: String, on machine: VagrantMachine) {
         busyMachines.insert(machine.id)
         updateIcon()
 
         // Actions run off the refresh queue so long `up`s don't block status updates.
         DispatchQueue.global(qos: .userInitiated).async { [client] in
-            let result = Result { try client.run([command, machine.id], in: machine.home) }
+            let result = Result { try client.run(arguments, in: machine.home) }
             DispatchQueue.main.async {
                 self.busyMachines.remove(machine.id)
                 switch result {
@@ -246,10 +290,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        message: "Another Vagrant command is still working on this machine. Try again when it finishes.")
                         break
                     }
-                    self.showError(title: "vagrant \(command) failed for \(machine.name)",
+                    self.showError(title: "\(title) failed for \(machine.name)",
                                    message: VagrantClient.tail(output))
                 case .failure(let error):
-                    self.showError(title: "vagrant \(command) failed for \(machine.name)",
+                    self.showError(title: "\(title) failed for \(machine.name)",
                                    message: error.localizedDescription)
                 default:
                     break
@@ -288,6 +332,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             break
         }
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(settingsClicked), keyEquivalent: ",")
+        settingsItem.target = self
+        items.append(settingsItem)
         item("About VagrantBar", #selector(aboutClicked))
         if updates.state == .checking {
             item("Checking for Updates…", nil)
