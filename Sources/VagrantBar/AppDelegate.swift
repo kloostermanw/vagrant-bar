@@ -19,6 +19,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private let settings = SettingsModel()
     private var settingsWindow: SettingsWindowController?
+    /// The latest action started from the menu, per machine id. Kept in memory only.
+    private var logs: [String: ActionLog] = [:]
+    /// Running actions, per machine id, for sending input and stopping them.
+    private var runners: [String: PTYRunner] = [:]
+    private var logWindows: [String: LogWindowController] = [:]
+    /// Running actions the user stopped from the log window: no failure alert for those.
+    private var stoppedByUser: Set<String> = []
+    /// Fires when an action's output has been quiet long enough to check for a prompt.
+    private var promptTimers: [String: Timer] = [:]
 
     /// Identifies a custom command menu item: which command, on which machine.
     private struct CustomCommandRef {
@@ -57,6 +66,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkForUpdatesInBackground() }
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !runners.isEmpty else { return .terminateNow }
+        // Actions run on the app's terminal, which closes on quit and stops them.
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Quit while actions are running?"
+        alert.informativeText = "Quitting VagrantBar stops the Vagrant commands it started."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit")
+        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
     }
 
     // MARK: - Refresh
@@ -206,6 +227,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !commands.isEmpty { sub.addItem(.separator()) }
         add("SSH", #selector(sshClicked(_:)), enabled: machine.isRunning)
         add("Open Folder", #selector(openFolderClicked(_:)), enabled: !machine.home.isEmpty)
+        sub.addItem(.separator())
+        // Stays enabled while busy: watching a running action is the main reason to open it.
+        let logItem = NSMenuItem(title: "Show Log", action: #selector(showLogClicked(_:)), keyEquivalent: "")
+        logItem.target = self
+        logItem.representedObject = machine.id
+        logItem.isEnabled = logs[machine.id] != nil
+        sub.addItem(logItem)
         item.submenu = sub
         return item
     }
@@ -230,6 +258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settingsWindow = SettingsWindowController(model: settings)
         }
         settingsWindow?.show()
+    }
+
+    @objc private func showLogClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        showLog(for: id)
     }
 
     @objc private func openFolderClicked(_ sender: NSMenuItem) {
@@ -274,26 +307,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         run([command, machine.id], title: "vagrant \(command)", on: machine)
     }
 
-    /// Runs `vagrant <arguments>` for `machine` in the background, showing an alert on failure.
+    /// Runs `vagrant <arguments>` for `machine` in the background on a pseudo-terminal,
+    /// logging its output and showing an alert on failure. When the command stops on a
+    /// prompt (sudo's password for NFS exports, ...), the log window opens to answer it.
     private func run(_ arguments: [String], title: String, on machine: VagrantMachine) {
-        busyMachines.insert(machine.id)
+        let id = machine.id
+        var log = ActionLog(command: (["vagrant"] + arguments).map(Self.displayArgument).joined(separator: " "))
+        let runner: PTYRunner
+        do {
+            runner = try client.interactiveRunner(arguments, in: machine.home)
+        } catch {
+            log.status = .couldNotStart(error.localizedDescription)
+            setLog(log, for: id)
+            showError(title: "\(title) failed for \(machine.name)", message: error.localizedDescription)
+            return
+        }
+        setLog(log, for: id)
+        runners[id] = runner
+        busyMachines.insert(id)
         updateIcon()
 
         // Actions run off the refresh queue so long `up`s don't block status updates.
-        DispatchQueue.global(qos: .userInitiated).async { [client] in
-            let result = Result { try client.run(arguments, in: machine.home) }
+        // Output and the result are both delivered through the main queue, so they stay in order.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result {
+                try VagrantClient.run(runner) { chunk in
+                    DispatchQueue.main.async { self.received(chunk, for: id) }
+                }
+            }
             DispatchQueue.main.async {
-                self.busyMachines.remove(machine.id)
+                self.busyMachines.remove(id)
+                self.runners[id] = nil
+                self.promptTimers.removeValue(forKey: id)?.invalidate()
+                let stopped = self.stoppedByUser.remove(id) != nil
                 switch result {
+                case _ where stopped:
+                    self.logs[id]?.status = .stopped
+                case .success(let r):
+                    self.logs[id]?.status = .exited(r.status)
+                case .failure(let error):
+                    self.logs[id]?.status = .couldNotStart(error.localizedDescription)
+                }
+                if let log = self.logs[id] { self.logWindows[id]?.update(log) }
+
+                switch result {
+                case _ where stopped:
+                    break
                 case .success(let r) where r.status != 0:
-                    let output = r.stderr.isEmpty ? r.stdout : r.stderr
-                    if VagrantClient.isMachineLockedError(output) {
+                    if VagrantClient.isMachineLockedError(r.stdout) {
                         self.showError(title: "\(machine.name) is busy",
                                        message: "Another Vagrant command is still working on this machine. Try again when it finishes.")
                         break
                     }
                     self.showError(title: "\(title) failed for \(machine.name)",
-                                   message: VagrantClient.tail(output))
+                                   message: VagrantClient.tail(self.logs[id]?.text ?? r.stdout),
+                                   logFor: id)
                 case .failure(let error):
                     self.showError(title: "\(title) failed for \(machine.name)",
                                    message: error.localizedDescription)
@@ -306,13 +374,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func showError(title: String, message: String) {
+    private func setLog(_ log: ActionLog, for id: String) {
+        logs[id] = log
+        logWindows[id]?.update(log)
+        logWindows[id]?.setPrompt(nil)
+        if let menu = statusItem.menu { buildMenu(menu) }
+    }
+
+    private func received(_ chunk: String, for id: String) {
+        guard logs[id] != nil else { return }
+        logs[id]?.append(chunk)
+        logWindows[id]?.update(logs[id]!)
+        // A prompt is a line that stays unfinished: check once the output has gone quiet.
+        promptTimers[id]?.invalidate()
+        promptTimers[id] = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkForPrompt(id) }
+        }
+    }
+
+    private func checkForPrompt(_ id: String) {
+        promptTimers[id] = nil
+        guard runners[id] != nil, let log = logs[id], let prompt = PromptDetector.prompt(in: log.text) else { return }
+        showLog(for: id, focusInput: true)
+        logWindows[id]?.setPrompt(prompt)
+    }
+
+    private func showLog(for id: String, focusInput: Bool = false) {
+        guard let log = logs[id] else { return }
+        let window = logWindows[id] ?? makeLogWindow(for: id)
+        window.update(log)
+        window.show(focusInput: focusInput)
+    }
+
+    private func makeLogWindow(for id: String) -> LogWindowController {
+        let name = machines.first { $0.id == id }?.name ?? id
+        let window = LogWindowController(machineName: name)
+        window.onSend = { [weak self] text in self?.runners[id]?.send(text + "\n") }
+        window.onStop = { [weak self] in
+            guard let self, let runner = self.runners[id] else { return }
+            self.stoppedByUser.insert(id)
+            runner.terminate()
+        }
+        logWindows[id] = window
+        return window
+    }
+
+    /// Quotes an argument for display when the shell would split it.
+    private static func displayArgument(_ argument: String) -> String {
+        let plain = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_./=:@%+,"))
+        return argument.unicodeScalars.allSatisfy(plain.contains) && !argument.isEmpty
+            ? argument : VagrantClient.shellQuoted(argument)
+    }
+
+    /// Shows an error alert; with `logFor`, it offers to open that machine's full log.
+    private func showError(title: String, message: String, logFor id: String? = nil) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = title
         alert.informativeText = message
-        alert.runModal()
+        alert.addButton(withTitle: "OK")
+        if id != nil { alert.addButton(withTitle: "Show Log") }
+        if alert.runModal() == .alertSecondButtonReturn, let id {
+            showLog(for: id)
+        }
     }
 
     // MARK: - About & updates
