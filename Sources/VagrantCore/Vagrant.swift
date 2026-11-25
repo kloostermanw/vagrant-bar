@@ -96,10 +96,7 @@ public struct VagrantClient: Sendable {
             process.currentDirectoryURL = URL(fileURLWithPath: directory)
         }
 
-        var env = ProcessInfo.processInfo.environment
-        let extra = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = env["PATH"].map { "\(extra):\($0)" } ?? extra
-        process.environment = env
+        process.environment = Self.environment()
 
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -125,6 +122,38 @@ public struct VagrantClient: Sendable {
             stdout: String(decoding: outData, as: UTF8.self),
             stderr: String(decoding: errData, as: UTF8.self)
         )
+    }
+
+    /// Prepares `vagrant <arguments>` to run on a pseudo-terminal, so prompts such as
+    /// sudo's password request for NFS exports can be answered through the runner.
+    public func interactiveRunner(_ arguments: [String], in directory: String? = nil) throws -> PTYRunner {
+        guard FileManager.default.isExecutableFile(atPath: binary) else {
+            throw VagrantError.missingBinary(binary)
+        }
+        var env = Self.environment()
+        // Vagrant colors its output on a terminal; the log shows plain text.
+        env["VAGRANT_NO_COLOR"] = "1"
+        return PTYRunner(executable: binary, arguments: arguments, directory: directory, environment: env)
+    }
+
+    /// Runs `runner` to completion, passing output along as it arrives. The terminal
+    /// merges stdout and stderr, so the result carries all output in `stdout`.
+    public static func run(_ runner: PTYRunner, onOutput: (String) -> Void) throws -> CommandResult {
+        var output = ""
+        let status = try runner.run { chunk in
+            output += chunk
+            onOutput(chunk)
+        }
+        return CommandResult(status: status, stdout: output, stderr: "")
+    }
+
+    /// The app's environment, with the usual install locations on PATH: an app started
+    /// from Finder doesn't get the user's shell PATH.
+    static func environment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let extra = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = env["PATH"].map { "\(extra):\($0)" } ?? extra
+        return env
     }
 
     /// Wraps `text` in single quotes for a POSIX shell.
